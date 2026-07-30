@@ -1,0 +1,27 @@
+<idea-plugin>
+    <id>com.alexkoleda.crosspick</id>
+    <name>CrossPick</name>
+    <vendor>alexkoleda</vendor>
+
+    <description><![CDATA[
+    CrossPick lets you cherry-pick commits from a foreign ("source") repository
+    into the currently open project without adding it as a permanent remote by hand.
+    Scan a range of commits from a source repo/branch and cherry-pick them one at a time
+    into the currently checked out branch. Nothing is ever pushed automatically.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>Git4Idea</depends>
+
+    <idea-version since-build="242"/>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="CrossPick"
+                    anchor="right"
+                    icon="AllIcons.Vcs.Branch"
+                    factoryClass="com.alexkoleda.crosspick.ui.CrossPickToolWindowFactory"/>
+
+        <projectService serviceImplementation="com.alexkoleda.crosspick.service.CrossPickService"/>
+        <projectService serviceImplementation="com.alexkoleda.crosspick.state.CrossPickState"/>
+    </extensions>
+</idea-plugin>
