@@ -164,13 +164,6 @@ object GitOps {
         return Git.getInstance().runCommand(handler)
     }
 
-    /** Runs `git cherry-pick --continue`. */
-    fun cherryPickContinue(repo: GitRepository): GitCommandResult {
-        val handler = GitLineHandler(repo.project, repo.root, GitCommand.CHERRY_PICK)
-        handler.addParameters("--continue")
-        return Git.getInstance().runCommand(handler)
-    }
-
     /** Runs `git cherry-pick --abort`. */
     fun cherryPickAbort(repo: GitRepository): GitCommandResult {
         val handler = GitLineHandler(repo.project, repo.root, GitCommand.CHERRY_PICK)
@@ -178,38 +171,64 @@ object GitOps {
         return Git.getInstance().runCommand(handler)
     }
 
-    /** Runs `git cherry-pick --skip`. */
+    /**
+     * Runs `git cherry-pick --skip`. Used internally to clear the halted state left
+     * behind when a pick turns out to be empty (its changes are already present).
+     */
     fun cherryPickSkip(repo: GitRepository): GitCommandResult {
         val handler = GitLineHandler(repo.project, repo.root, GitCommand.CHERRY_PICK)
         handler.addParameters("--skip")
         return Git.getInstance().runCommand(handler)
     }
 
-    /** Runs `git cherry-pick --quit`. */
-    fun cherryPickQuit(repo: GitRepository): GitCommandResult {
-        val handler = GitLineHandler(repo.project, repo.root, GitCommand.CHERRY_PICK)
-        handler.addParameters("--quit")
-        return Git.getInstance().runCommand(handler)
-    }
-
     /**
-     * Returns true if a cherry-pick is currently in progress in [repo], i.e.
-     * `CHERRY_PICK_HEAD` exists, checked via
-     * `git rev-parse --verify --quiet CHERRY_PICK_HEAD`.
+     * Returns the SHA that `CHERRY_PICK_HEAD` points at in [repo], or null if no
+     * cherry-pick is in progress. Uses `git rev-parse --verify --quiet CHERRY_PICK_HEAD`.
      */
-    fun isCherryPickInProgress(repo: GitRepository): Boolean {
+    fun cherryPickHeadSha(repo: GitRepository): String? {
         val handler = GitLineHandler(repo.project, repo.root, GitCommand.REV_PARSE)
         handler.addParameters("--verify", "--quiet", "CHERRY_PICK_HEAD")
         val result = Git.getInstance().runCommand(handler)
-        return result.success() && result.outputAsJoinedString.isNotBlank()
+        return result.outputAsJoinedString.trim().takeIf { result.success() && it.isNotEmpty() }
+    }
+
+    /** Returns true if a cherry-pick is currently in progress in [repo]. */
+    fun isCherryPickInProgress(repo: GitRepository): Boolean = cherryPickHeadSha(repo) != null
+
+    /**
+     * Returns the repository-relative paths of files with unresolved merge conflicts,
+     * using `git diff --name-only --diff-filter=U`.
+     */
+    fun conflictedFiles(repo: GitRepository): List<String> {
+        val handler = GitLineHandler(repo.project, repo.root, GitCommand.DIFF)
+        handler.addParameters("--name-only", "--diff-filter=U")
+        val result = Git.getInstance().runCommand(handler)
+        if (!result.success()) {
+            LOG.warn("git diff --diff-filter=U failed: ${result.errorOutputAsJoinedString}")
+            return emptyList()
+        }
+        return result.output.filter { it.isNotBlank() }.distinct()
     }
 
     /**
-     * Returns true if `git status --porcelain` reports no pending changes in [repo].
+     * Returns true if the index differs from `HEAD` (`git diff --cached --quiet` exits
+     * non-zero). Distinguishes an empty halted pick from one whose conflicts were
+     * resolved automatically (e.g. by rerere) and only needs committing.
+     */
+    fun hasStagedChanges(repo: GitRepository): Boolean {
+        val handler = GitLineHandler(repo.project, repo.root, GitCommand.DIFF)
+        handler.addParameters("--cached", "--quiet")
+        return !Git.getInstance().runCommand(handler).success()
+    }
+
+    /**
+     * Returns true if `git status --porcelain -uno` reports no pending changes to
+     * tracked files in [repo]. Untracked files are ignored: they don't block a
+     * cherry-pick unless the pick would overwrite them, which git reports itself.
      */
     fun isCleanWorkingTree(repo: GitRepository): Boolean {
         val handler = GitLineHandler(repo.project, repo.root, GitCommand.STATUS)
-        handler.addParameters("--porcelain")
+        handler.addParameters("--porcelain", "-uno")
         val result = Git.getInstance().runCommand(handler)
         return result.success() && result.output.none { it.isNotBlank() }
     }

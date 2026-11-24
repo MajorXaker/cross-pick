@@ -40,12 +40,11 @@ class ButtonColumn(
         TransferStatus.IN_PROGRESS -> "…"
         TransferStatus.TRANSFERRED -> "Transferred"
         TransferStatus.ALREADY_APPLIED -> "Already applied"
-        TransferStatus.FAILED -> "Retry"
+        TransferStatus.CONFLICT -> "Resolving…"
         TransferStatus.SKIPPED -> "Skipped"
     }
 
-    private fun enabledFor(row: CommitRow): Boolean =
-        row.status == TransferStatus.PENDING || row.status == TransferStatus.FAILED
+    private fun enabledFor(row: CommitRow): Boolean = row.status == TransferStatus.PENDING
 
     /**
      * Returns whether the given [row] is currently clickable, i.e. would trigger

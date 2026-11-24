@@ -1,24 +1,48 @@
 package com.alexkoleda.crosspick.service
 
-import com.alexkoleda.crosspick.export.CsvExporter
 import com.alexkoleda.crosspick.git.GitOps
 import com.alexkoleda.crosspick.model.CommitRow
 import com.alexkoleda.crosspick.model.TransferStatus
 import com.alexkoleda.crosspick.state.CrossPickState
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vcs.changes.VcsDirtyScopeManager
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VfsUtil
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.vcsUtil.VcsUtil
-import git4idea.commands.GitCommandResult
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryManager
+
+/** Result of [CrossPickService.scan]. */
+class ScanResult(
+    val rows: List<CommitRow>,
+    /** Root of the target repository the scan ran against. */
+    val repoRoot: VirtualFile,
+    /**
+     * If one of [rows] is halted mid cherry-pick ([TransferStatus.CONFLICT]), the
+     * target's HEAD at scan time, i.e. HEAD before that pick. Null otherwise.
+     */
+    val headBeforeInProgressPick: String?
+)
+
+/** Result of a single [CrossPickService.cherryPick] attempt. */
+class PickOutcome(
+    /** [TransferStatus.TRANSFERRED], [TransferStatus.ALREADY_APPLIED] or [TransferStatus.CONFLICT]. */
+    val status: TransferStatus,
+    /** Root of the target repository the pick ran in. */
+    val repoRoot: VirtualFile,
+    /** Target HEAD before the pick ran; used to tell a completed pick from an aborted one. */
+    val headBefore: String?,
+    /** Files left with unresolved conflicts, refreshed in the VFS. Empty unless [status] is CONFLICT. */
+    val conflictedFiles: List<VirtualFile> = emptyList()
+)
 
 /**
  * Project-level service coordinating CrossPick's git operations. Owns the resolution
@@ -33,7 +57,7 @@ import git4idea.repo.GitRepositoryManager
 class CrossPickService(private val project: Project) {
 
     /** Resolves the git repository backing the currently open project, if any. */
-    private fun resolveRepository(): GitRepository? {
+    fun resolveRepository(): GitRepository? {
         val manager = GitRepositoryManager.getInstance(project)
         val repositories = manager.repositories
         if (repositories.isEmpty()) return null
@@ -48,9 +72,11 @@ class CrossPickService(private val project: Project) {
      * Fetches [url]/[branch] into a dedicated CrossPick remote, then lists every
      * non-merge commit in `(initialSha, remoteRef]`, tagging rows that were already
      * transferred (per [CrossPickState] or a `cherry picked from commit` trailer found
-     * on `HEAD`) as [TransferStatus.ALREADY_APPLIED]. Invokes [onDone] on the EDT.
+     * on `HEAD`) as [TransferStatus.ALREADY_APPLIED], and the row whose cherry-pick is
+     * currently halted in the target (if any) as [TransferStatus.CONFLICT].
+     * Invokes [onDone] on the EDT.
      */
-    fun scan(url: String, branch: String, initialSha: String, onDone: (Result<List<CommitRow>>) -> Unit) {
+    fun scan(url: String, branch: String, initialSha: String, onDone: (Result<ScanResult>) -> Unit) {
         val repo = resolveRepository()
         if (repo == null) {
             invokeOnDone(onDone, Result.failure(IllegalStateException("No git repository found for this project.")))
@@ -105,7 +131,6 @@ class CrossPickService(private val project: Project) {
                     val key = stateKey(url, repo)
                     for (row in rows) {
                         if (alreadyPickedTrailers.contains(row.fullSha) ||
-                            alreadyPickedTrailers.contains(row.shortSha) ||
                             stateService.isTransferred(key, row.fullSha)
                         ) {
                             row.status = TransferStatus.ALREADY_APPLIED
@@ -114,11 +139,12 @@ class CrossPickService(private val project: Project) {
                         }
                     }
 
-                    stateService.state.lastSourceUrl = url
-                    stateService.state.lastSourceBranch = branch
-                    stateService.state.lastInitialSha = initialSha
+                    val inProgressSha = GitOps.cherryPickHeadSha(repo)
+                    val inProgressRow = inProgressSha?.let { sha -> rows.firstOrNull { it.fullSha == sha } }
+                    inProgressRow?.status = TransferStatus.CONFLICT
+                    val headBefore = if (inProgressRow != null) GitOps.getCurrentHeadSha(repo) else null
 
-                    invokeOnDone(onDone, Result.success(rows))
+                    invokeOnDone(onDone, Result.success(ScanResult(rows, repo.root, headBefore)))
                 } catch (e: Exception) {
                     invokeOnDone(onDone, Result.failure(e))
                 }
@@ -128,93 +154,99 @@ class CrossPickService(private val project: Project) {
 
     /**
      * Cherry-picks [row]'s commit into the target repository's current branch using
-     * `git cherry-pick -x`. Confirms the working tree is clean first (offering to
-     * proceed anyway via a yes/no dialog if not), refreshes VCS state after a
-     * successful pick, and classifies "nothing to commit" / already-empty outputs as
-     * [TransferStatus.ALREADY_APPLIED] and conflicts as [TransferStatus.FAILED].
+     * `git cherry-pick -x`, recording the result under [sourceUrl] in [CrossPickState].
+     *
+     * Everything runs in a background task: the in-progress and clean-tree checks
+     * (asking the user via a yes/no dialog whether to proceed when tracked files are
+     * modified), the pick itself, and the VCS refresh afterwards. The outcome is
+     * classified from the repository state rather than git's output text:
+     * - success → [TransferStatus.TRANSFERRED];
+     * - halted with unresolved files → [TransferStatus.CONFLICT], with those files
+     *   refreshed so the caller can open the merge dialog on them;
+     * - halted with nothing to commit (the commit's changes are already present) →
+     *   the halted pick is dropped with `git cherry-pick --skip` and the row is
+     *   [TransferStatus.ALREADY_APPLIED];
+     * - anything else → failure with git's error output.
+     *
      * Invokes [onDone] on the EDT.
      */
-    fun cherryPick(row: CommitRow, onDone: (Result<TransferStatus>) -> Unit) {
+    fun cherryPick(row: CommitRow, sourceUrl: String, onDone: (Result<PickOutcome>) -> Unit) {
         val repo = resolveRepository()
         if (repo == null) {
             invokeOnDone(onDone, Result.failure(IllegalStateException("No git repository found for this project.")))
             return
         }
 
-        if (!GitOps.isCleanWorkingTree(repo)) {
-            val proceed = ApplicationManager.getApplication().let { app ->
-                var answer = false
-                app.invokeAndWait {
-                    answer = Messages.showYesNoDialog(
-                        project,
-                        "The working tree has uncommitted changes. Cherry-pick anyway?",
-                        "CrossPick",
-                        "Continue Anyway",
-                        "Cancel",
-                        Messages.getWarningIcon()
-                    ) == Messages.YES
-                }
-                answer
-            }
-            if (!proceed) {
-                invokeOnDone(onDone, Result.failure(IllegalStateException("Cancelled: working tree is not clean.")))
-                return
-            }
-        }
-
         object : Task.Backgroundable(project, "CrossPick: Cherry-picking ${row.shortSha}", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
+                    if (GitOps.isCherryPickInProgress(repo)) {
+                        invokeOnDone(
+                            onDone,
+                            Result.failure(
+                                IllegalStateException("Another cherry-pick is in progress. Commit or abort it first.")
+                            )
+                        )
+                        return
+                    }
+
+                    if (!GitOps.isCleanWorkingTree(repo) && !confirmDirtyWorkingTree()) {
+                        invokeOnDone(onDone, Result.failure(IllegalStateException("Cancelled: working tree is not clean.")))
+                        return
+                    }
+
+                    val headBefore = GitOps.getCurrentHeadSha(repo)
+
                     indicator.text = "Cherry-picking ${row.shortSha}…"
                     val result = GitOps.cherryPick(repo, row.fullSha)
-                    val combinedOutput = (result.output + result.errorOutput).joinToString("\n").lowercase()
 
-                    val status: TransferStatus = when {
-                        result.success() -> TransferStatus.TRANSFERRED
+                    val outcome: PickOutcome = when {
+                        result.success() -> PickOutcome(TransferStatus.TRANSFERRED, repo.root, headBefore)
 
-                        combinedOutput.contains("nothing to commit") ||
-                            combinedOutput.contains("previous cherry-pick is now empty") ||
-                            combinedOutput.contains("the previous cherry-pick is now empty") -> TransferStatus.ALREADY_APPLIED
-
-                        combinedOutput.contains("conflict") ||
-                            combinedOutput.contains("after resolving the conflicts") -> TransferStatus.FAILED
-
-                        else -> TransferStatus.FAILED
-                    }
-
-                    if (status == TransferStatus.FAILED &&
-                        (combinedOutput.contains("conflict") || combinedOutput.contains("after resolving the conflicts"))
-                    ) {
-                        row.message = "Cherry-pick conflict. Resolve the conflicts in the IDE, then press " +
-                            "\"Continue current\"."
-                    } else if (status == TransferStatus.ALREADY_APPLIED &&
-                        (combinedOutput.contains("previous cherry-pick is now empty") ||
-                            combinedOutput.contains("nothing to commit"))
-                    ) {
-                        row.message = "This commit is already applied. Use 'Skip current' to drop it and " +
-                            "clear the cherry-pick state."
-                    } else if (status == TransferStatus.FAILED) {
-                        row.message = result.errorOutputAsJoinedString.ifBlank { "Cherry-pick failed." }
-                    }
-
-                    if (status == TransferStatus.TRANSFERRED || status == TransferStatus.ALREADY_APPLIED) {
-                        val stateService = project.getService(CrossPickState::class.java)
-                        stateService.markTransferred(stateKey(stateService.state.lastSourceUrl, repo), row.fullSha)
-
-                        // Capture the target SHA if the cherry-pick was successful
-                        if (status == TransferStatus.TRANSFERRED) {
-                            row.targetSha = GitOps.getCurrentHeadSha(repo)
+                        GitOps.isCherryPickInProgress(repo) -> {
+                            val conflictedPaths = GitOps.conflictedFiles(repo)
+                            if (conflictedPaths.isEmpty() && !GitOps.hasStagedChanges(repo)) {
+                                // Empty pick: the changes are already in the target. Drop the
+                                // halted pick so the repository doesn't stay mid cherry-pick.
+                                val skip = GitOps.cherryPickSkip(repo)
+                                if (!skip.success()) {
+                                    LOG.warn("git cherry-pick --skip failed: ${skip.errorOutputAsJoinedString}")
+                                }
+                                PickOutcome(TransferStatus.ALREADY_APPLIED, repo.root, headBefore)
+                            } else {
+                                PickOutcome(
+                                    TransferStatus.CONFLICT,
+                                    repo.root,
+                                    headBefore,
+                                    refreshFiles(repo, conflictedPaths)
+                                )
+                            }
                         }
+
+                        // Older git versions report an empty pick as "nothing to commit"
+                        // without leaving CHERRY_PICK_HEAD behind.
+                        result.errorOutputAsJoinedString.contains("nothing to commit", ignoreCase = true) ||
+                            result.outputAsJoinedString.contains("nothing to commit", ignoreCase = true) ->
+                            PickOutcome(TransferStatus.ALREADY_APPLIED, repo.root, headBefore)
+
+                        else -> throw IllegalStateException(
+                            result.errorOutputAsJoinedString.ifBlank { "Cherry-pick failed." }
+                        )
                     }
 
-                    if (status == TransferStatus.TRANSFERRED) {
-                        VcsDirtyScopeManager.getInstance(project).markEverythingDirty()
-                        repo.update()
-                        VirtualFileManager.getInstance().asyncRefresh(null)
+                    if (outcome.status == TransferStatus.TRANSFERRED || outcome.status == TransferStatus.ALREADY_APPLIED) {
+                        project.getService(CrossPickState::class.java)
+                            .markTransferred(stateKey(sourceUrl, repo), row.fullSha)
                     }
 
-                    invokeOnDone(onDone, Result.success(status))
+                    if (outcome.status == TransferStatus.TRANSFERRED || outcome.status == TransferStatus.CONFLICT) {
+                        refreshVcs(repo)
+                    }
+
+                    invokeOnDone(onDone, Result.success(outcome))
                 } catch (e: Exception) {
+                    // A failed pick can still have touched the working tree.
+                    refreshVcs(repo)
                     invokeOnDone(onDone, Result.failure(e))
                 }
             }
@@ -222,54 +254,18 @@ class CrossPickService(private val project: Project) {
     }
 
     /**
-     * Runs `git cherry-pick --continue` against the target repository's in-flight
-     * cherry-pick, refreshing VCS state on success. Only ever acts on the single
-     * currently-halted commit — there is no multi-commit sequence to advance through.
-     * Reports a friendly error via [onDone] if no cherry-pick is in progress.
-     */
-    fun continueInProgressPick(onDone: (Result<Unit>) -> Unit) {
-        runGuardedCherryPickAction("Continuing cherry-pick", GitOps::cherryPickContinue, refreshOnSuccess = true, onDone)
-    }
-
-    /**
      * Runs `git cherry-pick --abort` against the target repository's in-flight
-     * cherry-pick. Reports a friendly error via [onDone] if no cherry-pick is in
-     * progress.
+     * cherry-pick and refreshes VCS state. Reports a friendly error via [onDone] if no
+     * cherry-pick is in progress.
      */
     fun abortInProgressPick(onDone: (Result<Unit>) -> Unit) {
-        runGuardedCherryPickAction("Aborting cherry-pick", GitOps::cherryPickAbort, refreshOnSuccess = false, onDone)
-    }
-
-    /**
-     * Runs `git cherry-pick --skip` against the target repository's in-flight
-     * cherry-pick (used when the pick turned out empty and there's nothing to
-     * continue), refreshing VCS state on success. Reports a friendly error via
-     * [onDone] if no cherry-pick is in progress.
-     */
-    fun skipInProgressPick(onDone: (Result<Unit>) -> Unit) {
-        runGuardedCherryPickAction("Skipping cherry-pick", GitOps::cherryPickSkip, refreshOnSuccess = true, onDone)
-    }
-
-    /**
-     * Shared implementation backing [continueInProgressPick], [abortInProgressPick],
-     * and [skipInProgressPick]: resolves the target repository, guards on
-     * [GitOps.isCherryPickInProgress], runs [action] in a background task, and
-     * optionally refreshes VCS state on success — mirroring the refresh performed
-     * after a successful [cherryPick].
-     */
-    private fun runGuardedCherryPickAction(
-        taskTitle: String,
-        action: (GitRepository) -> GitCommandResult,
-        refreshOnSuccess: Boolean,
-        onDone: (Result<Unit>) -> Unit
-    ) {
         val repo = resolveRepository()
         if (repo == null) {
             invokeOnDone(onDone, Result.failure(IllegalStateException("No git repository found for this project.")))
             return
         }
 
-        object : Task.Backgroundable(project, "CrossPick: $taskTitle", true) {
+        object : Task.Backgroundable(project, "CrossPick: Aborting cherry-pick", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
                     if (!GitOps.isCherryPickInProgress(repo)) {
@@ -280,19 +276,14 @@ class CrossPickService(private val project: Project) {
                         return
                     }
 
-                    val result = action(repo)
+                    val result = GitOps.cherryPickAbort(repo)
+                    refreshVcs(repo)
                     if (!result.success()) {
                         invokeOnDone(
                             onDone,
                             Result.failure(IllegalStateException(result.errorOutputAsJoinedString.ifBlank { "Command failed." }))
                         )
                         return
-                    }
-
-                    if (refreshOnSuccess) {
-                        VcsDirtyScopeManager.getInstance(project).markEverythingDirty()
-                        repo.update()
-                        VirtualFileManager.getInstance().asyncRefresh(null)
                     }
 
                     invokeOnDone(onDone, Result.success(Unit))
@@ -305,16 +296,17 @@ class CrossPickService(private val project: Project) {
 
     /**
      * Updates [row]'s in-memory [CommitRow.status] and writes the corresponding change
-     * through to [CrossPickState]: [TransferStatus.SKIPPED] marks the SHA skipped,
-     * [TransferStatus.TRANSFERRED] marks it transferred, and any other status (e.g.
-     * reverting to [TransferStatus.PENDING]) clears it from both persisted sets.
+     * through to [CrossPickState] under [sourceUrl]: [TransferStatus.SKIPPED] marks the
+     * SHA skipped, [TransferStatus.TRANSFERRED] marks it transferred, and any other
+     * status (e.g. reverting to [TransferStatus.PENDING]) clears it from both
+     * persisted sets.
      */
-    fun setRowStatus(row: CommitRow, status: TransferStatus) {
+    fun setRowStatus(row: CommitRow, status: TransferStatus, sourceUrl: String) {
         row.status = status
 
         val repo = resolveRepository() ?: return
         val stateService = project.getService(CrossPickState::class.java)
-        val key = stateKey(stateService.state.lastSourceUrl, repo)
+        val key = stateKey(sourceUrl, repo)
         when (status) {
             TransferStatus.SKIPPED -> stateService.markSkipped(key, row.fullSha)
             TransferStatus.TRANSFERRED -> stateService.markTransferred(key, row.fullSha)
@@ -322,16 +314,38 @@ class CrossPickService(private val project: Project) {
         }
     }
 
+    /** Asks (on the EDT, blocking the calling background thread) whether to pick onto a dirty tree. */
+    private fun confirmDirtyWorkingTree(): Boolean {
+        var answer = false
+        ApplicationManager.getApplication().invokeAndWait {
+            answer = Messages.showYesNoDialog(
+                project,
+                "The working tree has uncommitted changes. Cherry-pick anyway?",
+                "CrossPick",
+                "Continue Anyway",
+                "Cancel",
+                Messages.getWarningIcon()
+            ) == Messages.YES
+        }
+        return answer
+    }
+
     /**
-     * Exports the given [rows] to a CSV file at [outputPath]. Runs in a background task.
+     * Synchronously refreshes the files at repository-relative [paths] so the IDE sees
+     * their conflict markers, and returns those that exist.
      */
-    fun exportToCSV(rows: List<CommitRow>, outputPath: String, onDone: (Result<String>) -> Unit) {
-        object : Task.Backgroundable(project, "CrossPick: Exporting to CSV", false) {
-            override fun run(indicator: ProgressIndicator) {
-                val result = CsvExporter.export(rows, outputPath).map { outputPath }
-                invokeOnDone(onDone, result)
-            }
-        }.queue()
+    private fun refreshFiles(repo: GitRepository, paths: List<String>): List<VirtualFile> {
+        val root = repo.root.toNioPath()
+        val files = paths.mapNotNull { LocalFileSystem.getInstance().refreshAndFindFileByNioFile(root.resolve(it)) }
+        VfsUtil.markDirtyAndRefresh(false, false, false, *files.toTypedArray())
+        return files
+    }
+
+    /** Makes the IDE pick up what git just did: changes, conflicts and repository state. */
+    private fun refreshVcs(repo: GitRepository) {
+        VcsDirtyScopeManager.getInstance(project).markEverythingDirty()
+        repo.update()
+        VirtualFileManager.getInstance().asyncRefresh(null)
     }
 
     /** Builds the persisted-state lookup key "sourceUrl|targetRepoRoot" for [repo]. */
@@ -341,5 +355,9 @@ class CrossPickService(private val project: Project) {
         ApplicationManager.getApplication().invokeLater {
             onDone(result)
         }
+    }
+
+    private companion object {
+        val LOG = logger<CrossPickService>()
     }
 }

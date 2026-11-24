@@ -5,16 +5,15 @@ import com.alexkoleda.crosspick.model.CommitRow
 import com.alexkoleda.crosspick.model.TransferStatus
 import com.alexkoleda.crosspick.service.CrossPickService
 import com.alexkoleda.crosspick.state.CrossPickState
+import com.intellij.dvcs.repo.Repository
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
-import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
-import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.JBPopupMenu
-import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.SimpleToolWindowPanel
-import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vcs.AbstractVcsHelper
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
@@ -23,10 +22,9 @@ import com.intellij.ui.dsl.builder.AlignX
 import com.intellij.ui.dsl.builder.panel
 import com.intellij.ui.table.TableView
 import com.intellij.util.ui.JBUI
-import com.intellij.vcsUtil.VcsUtil
+import git4idea.GitVcs
 import git4idea.repo.GitRepository
-import git4idea.repo.GitRepositoryManager
-import javax.swing.Box
+import git4idea.repo.GitRepositoryChangeListener
 import java.awt.BorderLayout
 import java.awt.Cursor
 import java.awt.datatransfer.StringSelection
@@ -34,6 +32,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseMotionAdapter
 import javax.swing.BoxLayout
+import javax.swing.JButton
 import javax.swing.JMenuItem
 import javax.swing.JPanel
 import javax.swing.ListSelectionModel
@@ -45,14 +44,29 @@ import javax.swing.SwingUtilities
  * commits with per-row cherry-pick actions, and a status line. All git work is
  * delegated to [CrossPickService] and runs off the EDT; this panel only mutates Swing
  * state on the EDT.
+ *
+ * Only one CrossPick git operation runs at a time ([busy]). When a cherry-pick stops
+ * on conflicts, the IDE's merge dialog is opened on the conflicted files and the row
+ * shows "Resolving…" ([TransferStatus.CONFLICT]); the panel then listens for git
+ * repository changes and, once the target repository leaves the cherry-picking state,
+ * marks the row [TransferStatus.TRANSFERRED] (HEAD moved: the user committed) or back
+ * to [TransferStatus.PENDING] (HEAD unchanged: the pick was aborted).
  */
-class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true, true) {
+class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true, true), Disposable {
+
+    /** A cherry-pick of [row] that stopped on conflicts and hasn't been committed or aborted yet. */
+    private class ActiveConflict(
+        val row: CommitRow,
+        val repoRoot: VirtualFile,
+        val headBefore: String?,
+        val sourceUrl: String
+    )
 
     private val sourceUrlField = JBTextField()
     private val sourceBranchField = JBTextField()
     private val initialShaField = JBTextField()
     private val statusLabel = JBLabel(" ")
-    private val hintLabel = JBLabel("Nothing is pushed \u2014 push manually when ready.")
+    private val hintLabel = JBLabel("Nothing is pushed — push manually when ready.")
 
     private val tableModel = CommitTableModel(
         { row -> onCherryPickClicked(row) },
@@ -72,8 +86,7 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
     /** Model column index of the abort/skip button column. */
     private val abortSkipColumnModelIndex: Int = tableModel.columnInfos.indexOfFirst { it === abortSkipColumn }
 
-    private val scanButton: javax.swing.JButton
-    private val exportButton: javax.swing.JButton
+    private val scanButton: JButton
 
     private val state: CrossPickState
         get() = project.getService(CrossPickState::class.java)
@@ -81,8 +94,17 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
     private val service: CrossPickService
         get() = project.getService(CrossPickService::class.java)
 
-    private var taskRunning: Boolean = false
-    private var currentRows: List<CommitRow> = emptyList()
+    /** True while a CrossPick git operation (scan, cherry-pick, abort) is running. */
+    private var busy: Boolean = false
+
+    /**
+     * Source URL the rows currently in the table were scanned from. Keys every persisted
+     * status change, so editing the URL field (or a failed scan of another URL) can't
+     * file records under the wrong source.
+     */
+    private var scannedSourceUrl: String? = null
+
+    private var activeConflict: ActiveConflict? = null
 
     init {
         val formPanel = panel {
@@ -97,21 +119,12 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
             }
         }
 
-        scanButton = javax.swing.JButton("Scan").apply { addActionListener { onScanClicked() } }
-        exportButton = javax.swing.JButton("Export to CSV").apply { addActionListener { onExportClicked() } }
-        exportButton.isEnabled = false
+        scanButton = JButton("Scan").apply { addActionListener { onScanClicked() } }
 
-        val scanRow = JPanel().apply {
+        val buttonsPanel = JPanel().apply {
             layout = BoxLayout(this, BoxLayout.X_AXIS)
             border = JBUI.Borders.empty(4, 0)
             add(scanButton)
-            add(javax.swing.Box.createHorizontalStrut(8))
-            add(exportButton)
-        }
-
-        val buttonsPanel = JPanel().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
-            add(scanRow)
         }
 
         val topPanel = JPanel(BorderLayout()).apply {
@@ -141,8 +154,17 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
             }
         )
 
+        project.messageBus.connect(this).subscribe(
+            GitRepository.GIT_REPO_CHANGE,
+            GitRepositoryChangeListener { repo ->
+                ApplicationManager.getApplication().invokeLater({ onRepositoryChanged(repo) }, project.disposed)
+            }
+        )
+
         prefillFromState()
     }
+
+    override fun dispose() = Unit
 
     /** Populates the form fields from the last persisted scan inputs, if any. */
     private fun prefillFromState() {
@@ -156,18 +178,20 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
         statusLabel.text = text
     }
 
-    private fun setTaskRunning(running: Boolean) {
-        taskRunning = running
-        scanButton.isEnabled = !running
+    private fun setBusy(value: Boolean) {
+        busy = value
+        scanButton.isEnabled = !value
     }
 
-    /**
-     * Refreshes the enabled state of [continueButton], [abortButton], and [skipButton]
-     * to reflect whether a cherry-pick is currently halted in the target repository.
-     * These three buttons only ever act on that single in-flight commit.
-     */
+    /** Returns true (and says so in the status line) if another operation is still running. */
+    private fun rejectIfBusy(): Boolean {
+        if (busy) setStatus("Another CrossPick operation is still running.")
+        return busy
+    }
 
     private fun onScanClicked() {
+        if (rejectIfBusy()) return
+
         val url = sourceUrlField.text.trim()
         val branch = sourceBranchField.text.trim()
         val sha = initialShaField.text.trim()
@@ -181,17 +205,21 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
         state.state.lastSourceBranch = branch
         state.state.lastInitialSha = sha
 
-        setTaskRunning(true)
-        setStatus("Scanning $url ($branch)\u2026")
+        setBusy(true)
+        setStatus("Scanning $url ($branch)…")
 
         service.scan(url, branch, sha) { result ->
-            setTaskRunning(false)
+            setBusy(false)
             result.fold(
-                onSuccess = { rows ->
-                    currentRows = rows
-                    tableModel.items = rows
-                    exportButton.isEnabled = rows.isNotEmpty()
-                    setStatus("Found ${rows.size} commit(s).")
+                onSuccess = { scan ->
+                    scannedSourceUrl = url
+                    tableModel.items = scan.rows
+                    val conflictRow = scan.rows.firstOrNull { it.status == TransferStatus.CONFLICT }
+                    activeConflict = conflictRow?.let { ActiveConflict(it, scan.repoRoot, scan.headBeforeInProgressPick, url) }
+                    setStatus(
+                        "Found ${scan.rows.size} commit(s)." +
+                            (conflictRow?.let { " ${it.shortSha} is mid cherry-pick: ${RESOLVE_HINT}" } ?: "")
+                    )
                 },
                 onFailure = { error ->
                     setStatus("Scan failed: ${error.message}")
@@ -201,77 +229,98 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
     }
 
     private fun onCherryPickClicked(row: CommitRow) {
-        if (row.status != TransferStatus.PENDING && row.status != TransferStatus.FAILED) return
+        if (rejectIfBusy()) return
+        if (row.status != TransferStatus.PENDING) return
+        activeConflict?.let {
+            setStatus("Commit or abort the cherry-pick of ${it.row.shortSha} first.")
+            return
+        }
+        val sourceUrl = scannedSourceUrl ?: return
 
         row.status = TransferStatus.IN_PROGRESS
+        row.message = null
+        setBusy(true)
         refreshTable()
-        setStatus("Cherry-picking ${row.shortSha}\u2026")
+        setStatus("Cherry-picking ${row.shortSha}…")
 
-        service.cherryPick(row) { result ->
+        service.cherryPick(row, sourceUrl) { result ->
+            setBusy(false)
             result.fold(
-                onSuccess = { status ->
-                    row.status = status
-                    setStatus(
-                        when (status) {
-                            TransferStatus.TRANSFERRED -> "Cherry-picked ${row.shortSha}."
-                            TransferStatus.ALREADY_APPLIED -> "${row.shortSha} was already applied."
-                            TransferStatus.FAILED -> row.message ?: "Cherry-pick of ${row.shortSha} failed."
-                            else -> " "
+                onSuccess = { outcome ->
+                    row.status = outcome.status
+                    when (outcome.status) {
+                        TransferStatus.TRANSFERRED -> setStatus("Cherry-picked ${row.shortSha}.")
+                        TransferStatus.ALREADY_APPLIED ->
+                            setStatus("${row.shortSha} is already applied; nothing to transfer.")
+                        TransferStatus.CONFLICT -> {
+                            activeConflict = ActiveConflict(row, outcome.repoRoot, outcome.headBefore, sourceUrl)
+                            setStatus("Cherry-pick of ${row.shortSha} stopped on conflicts: $RESOLVE_HINT")
+                            refreshTable()
+                            showMergeDialog(outcome.conflictedFiles)
                         }
-                    )
+                        else -> setStatus(" ")
+                    }
                 },
                 onFailure = { error ->
-                    row.status = TransferStatus.FAILED
+                    row.status = TransferStatus.PENDING
                     row.message = error.message
-                    setStatus("Cherry-pick failed: ${error.message}")
+                    setStatus("Cherry-pick of ${row.shortSha} failed: ${error.message}")
                 }
             )
             refreshTable()
         }
     }
 
-    private fun onExportClicked() {
-        if (currentRows.isEmpty()) {
-            setStatus("No commits to export.")
-            return
-        }
-
-        val descriptor = FileChooserDescriptorFactory.createSingleFileDescriptor("csv")
-        val dialog = FileChooserFactory.getInstance().createFileChooser(descriptor, project, null)
-        val files = dialog.choose(project, null)
-
+    /** Opens the IDE's merge dialog (the same one "Update Project" shows) on [files]. */
+    private fun showMergeDialog(files: List<VirtualFile>) {
         if (files.isEmpty()) return
+        AbstractVcsHelper.getInstance(project).showMergeDialog(files, GitVcs.getInstance(project).mergeProvider)
+    }
 
-        val selectedFile = files.first()
-        val filePath = selectedFile.path
+    /**
+     * Settles [activeConflict] once its repository is no longer mid cherry-pick: if HEAD
+     * moved the user committed the resolved pick, otherwise it was aborted.
+     */
+    private fun onRepositoryChanged(repo: GitRepository) {
+        val conflict = activeConflict ?: return
+        if (repo.root != conflict.repoRoot) return
+        if (repo.state == Repository.State.GRAFTING) return
 
-        setStatus("Exporting to $filePath\u2026")
-        service.exportToCSV(currentRows, filePath) { result ->
-            result.fold(
-                onSuccess = { path ->
-                    setStatus("Exported ${currentRows.size} commit(s) to $path")
-                },
-                onFailure = { error ->
-                    setStatus("Export failed: ${error.message}")
-                }
-            )
+        activeConflict = null
+        val head = repo.currentRevision
+        val committed = conflict.headBefore != null && head != null && head != conflict.headBefore
+        val row = conflict.row
+        row.message = null
+        if (committed) {
+            service.setRowStatus(row, TransferStatus.TRANSFERRED, conflict.sourceUrl)
+            setStatus("Cherry-pick of ${row.shortSha} completed.")
+        } else {
+            service.setRowStatus(row, TransferStatus.PENDING, conflict.sourceUrl)
+            setStatus("Cherry-pick of ${row.shortSha} was aborted.")
         }
+        refreshTable()
     }
 
     private fun onAbortOrSkip(row: CommitRow) {
-        setStatus("Checking cherry-pick state\u2026")
+        if (rejectIfBusy()) return
+        val sourceUrl = scannedSourceUrl ?: return
+
+        setBusy(true)
+        setStatus("Checking cherry-pick state…")
         // Run the check in a background task to avoid EDT violations
         object : Task.Backgroundable(project, "CrossPick: Checking cherry-pick state", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    val repo = getRepository()
+                    val repo = service.resolveRepository()
                     val isInProgress = repo != null && GitOps.isCherryPickInProgress(repo)
 
                     ApplicationManager.getApplication().invokeLater {
                         if (isInProgress) {
-                            // A cherry-pick is in progress, abort it
-                            setStatus("Aborting cherry-pick\u2026")
+                            // A cherry-pick is in progress, abort it. The repository listener
+                            // moves the conflicted row back to pending once git is done.
+                            setStatus("Aborting cherry-pick…")
                             service.abortInProgressPick { result ->
+                                setBusy(false)
                                 setStatus(
                                     result.fold(
                                         onSuccess = { "Cherry-pick aborted." },
@@ -282,30 +331,20 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
                             }
                         } else {
                             // No cherry-pick in progress, mark as skipped
-                            service.setRowStatus(row, TransferStatus.SKIPPED)
+                            setBusy(false)
+                            service.setRowStatus(row, TransferStatus.SKIPPED, sourceUrl)
                             setStatus("Marked ${row.shortSha} as skipped.")
                             refreshTable()
                         }
                     }
                 } catch (e: Exception) {
                     ApplicationManager.getApplication().invokeLater {
+                        setBusy(false)
                         setStatus("Error: ${e.message}")
                     }
                 }
             }
         }.queue()
-    }
-
-    /** Gets the git repository for the current project. */
-    private fun getRepository(): GitRepository? {
-        val manager = GitRepositoryManager.getInstance(project)
-        val repositories = manager.repositories
-        if (repositories.isEmpty()) return null
-        if (repositories.size == 1) return repositories.first()
-        val basePath = project.basePath ?: return repositories.first()
-        val projectDir: VirtualFile = LocalFileSystem.getInstance().findFileByPath(basePath) ?: return repositories.first()
-        val rootFile: VirtualFile? = VcsUtil.getVcsRootFor(project, projectDir)
-        return repositories.firstOrNull { it.root == rootFile } ?: repositories.first()
     }
 
     private fun refreshTable() {
@@ -442,12 +481,19 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
             .map { table.convertRowIndexToModel(it) }
             .map { tableModel.getItem(it) }
 
-    /** Applies [status] to every currently-selected row via [CrossPickService.setRowStatus]. */
+    /**
+     * Applies [status] to every currently-selected row via [CrossPickService.setRowStatus].
+     * Rows with a cherry-pick in flight (running or halted on conflicts) are left alone:
+     * their status is settled by git, not by hand.
+     */
     private fun applyStatusToSelectedRows(status: TransferStatus) {
-        val rows = selectedRows()
+        val sourceUrl = scannedSourceUrl ?: return
+        val rows = selectedRows().filter {
+            it.status != TransferStatus.IN_PROGRESS && it.status != TransferStatus.CONFLICT
+        }
         if (rows.isEmpty()) return
         for (row in rows) {
-            service.setRowStatus(row, status)
+            service.setRowStatus(row, status, sourceUrl)
         }
         refreshTable()
         setStatus("Marked ${rows.size} commit(s) as ${status.name.lowercase()}.")
@@ -461,5 +507,9 @@ class CrossPickPanel(private val project: Project) : SimpleToolWindowPanel(true,
         val clipboard = java.awt.Toolkit.getDefaultToolkit().systemClipboard
         clipboard.setContents(StringSelection(text), null)
         setStatus("Copied ${rows.size} SHA(s) to clipboard.")
+    }
+
+    private companion object {
+        const val RESOLVE_HINT = "resolve the conflicts, then commit to finish, or click × to abort."
     }
 }

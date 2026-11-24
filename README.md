@@ -14,11 +14,9 @@ It adds a **CrossPick** tool window (right-hand side, branch icon) where you can
    not yet transferred.
 3. Click **Cherry-pick** on any row to `git cherry-pick -x` that commit into your
    currently checked-out branch in the open project.
-4. If a cherry-pick conflicts, resolve it right in the IDE's normal merge tooling,
-   then click **Continue current** (or **Abort current** to bail out). See
-   [Conflicted commit: Continue / Skip / Abort](#conflicted-commit-continue--skip--abort)
-   below — each cherry-pick is a single-commit `git cherry-pick -x <sha>`, so these
-   buttons only ever act on that one in-flight commit, never on a queued sequence.
+4. If a cherry-pick conflicts, the IDE's merge dialog opens on the conflicted files.
+   Resolve them and commit as usual; CrossPick notices the commit and marks the row
+   transferred. See [Conflicts](#conflicts) below.
 
 CrossPick **never runs `git push`**. Everything it does stays local until you
 decide to push manually — the tool window says so directly under the commit table.
@@ -143,15 +141,20 @@ main IDE installation. Sandbox data is isolated in a temporary directory.
 
 6. **Cherry-pick commits**:
    - Click **Cherry-pick** on any row to apply that commit to your current branch using `git cherry-pick -x`
+   - Only one CrossPick operation runs at a time; clicks while one is running are ignored
    - Successfully transferred commits are marked **Transferred** and shown with strikethrough
-   - Already-applied commits are marked **Already Applied**
+   - Already-applied commits are marked **Already Applied** (including picks that turn out
+     empty because the changes are already in your branch; CrossPick clears git's halted
+     state for those itself)
+   - If a pick fails for another reason (e.g. it would overwrite untracked files), the row
+     stays pending and the status line shows git's error
 
 7. **Handle conflicts** (if they occur):
-   - CrossPick marks conflicted rows as **Failed**
-   - Resolve the conflict in PyCharm's normal merge UI
-   - Click **Continue current** to complete the cherry-pick
-   - Or click **Abort current** to cancel
-   - See [Conflicted commit: Continue / Skip / Abort](#conflicted-commit-continue--skip--abort) for details
+   - The merge dialog opens automatically and the row shows **Resolving…**
+   - Resolve the conflicts, then commit (the commit message is pre-filled by git)
+   - The row switches to **Transferred** once the commit lands
+   - Or click **×** to abort the cherry-pick; the row goes back to pending
+   - See [Conflicts](#conflicts) for details
 
 8. **Push manually** — Nothing is pushed automatically. Push your changes from PyCharm's Git menu or the terminal once you're satisfied.
 
@@ -160,15 +163,14 @@ main IDE installation. Sandbox data is isolated in a temporary directory.
 CrossPick remembers:
 - Your last scan inputs (URL, branch, initial SHA)
 - Which commits you've transferred and which you've skipped
-- All state is stored per-project in `.idea/crosspick.xml`
+- All state is stored per-project in `.idea/crosspick.xml`, keyed by the source URL the
+  table was scanned from
 
 Re-open the tool window later and the form is pre-filled with your last inputs, making repeated scans faster.
 
 ## Skipping commits
 
-Because every transfer is a single-commit `git cherry-pick -x <sha>` fired by a
-per-row button — there is no multi-commit sequence under the hood — "skipping a
-commit" can mean three different things depending on why you're skipping:
+"Skipping a commit" can mean two things:
 
 1. **Just don't click Cherry-pick.** In the normal case, skipping a commit is
    simply never pressing the button for that row. CrossPick doesn't require
@@ -176,37 +178,33 @@ commit" can mean three different things depending on why you're skipping:
 2. **Mark as skipped, to record intent.** If you want CrossPick to remember
    that you deliberately decided *not* to transfer a commit (so it stays out of
    your way on future scans and is visually distinguished from a commit you
-   just haven't gotten to yet), select one or more rows, right-click, and choose
-   **Mark as skipped**. Skipped rows render dimmed and italicized (but *not*
-   struck through — strikethrough is reserved for rows that were actually
-   transferred) and their action button reads **Skipped** (disabled). The
-   right-click menu supports multi-select (`Ctrl`/`Cmd`-click or shift-click
-   rows first), so you can mark many rows at once. **Mark as transferred** and
-   **Reset to pending** are also available from the same menu if you need to
-   correct a row's state by hand, and **Copy full SHA** copies the selected
-   rows' full commit SHAs to the clipboard.
-3. **"Skip current", for the git-level empty-pick case.** Occasionally
-   `git cherry-pick -x <sha>` halts because the pick turned out empty (its
-   changes are already present) — git reports "The previous cherry-pick is now
-   empty" and leaves `CHERRY_PICK_HEAD` set, but there's nothing to run
-   `--continue` on. For that case (and only that case) CrossPick exposes a
-   **Skip current** button, which runs `git cherry-pick --skip` to drop the
-   halted pick and clear the cherry-pick state. If a row's cherry-pick result
-   looks like this, CrossPick's status message points you at this button
-   directly.
+   just haven't gotten to yet), click the row's **×** button, or select one or
+   more rows, right-click, and choose **Mark as skipped**. Skipped rows render
+   dimmed and italicized (but *not* struck through — strikethrough is reserved
+   for rows that were actually transferred) and their action button reads
+   **Skipped** (disabled). The right-click menu supports multi-select
+   (`Ctrl`/`Cmd`-click or shift-click rows first), so you can mark many rows at
+   once. **Mark as transferred** and **Reset to pending** are also available
+   from the same menu if you need to correct a row's state by hand, and
+   **Copy full SHA** copies the selected rows' full commit SHAs to the clipboard.
 
-### Conflicted commit: Continue / Skip / Abort
+### Conflicts
 
-The **Continue current** / **Skip current** / **Abort current** buttons live in
-their own labeled row ("Conflicted commit:") because they only ever operate on
-the single commit that halted the most recent `git cherry-pick -x` — there is no
-queue of commits to step through, so "continue"/"skip"/"abort" never affect any
-row other than the one currently in flight. They're enabled only while
-`CHERRY_PICK_HEAD` exists in the target repository (checked via
-`git rev-parse --verify --quiet CHERRY_PICK_HEAD`), and CrossPick refreshes that
-check after every scan, every cherry-pick attempt, and after each of the three
-buttons is used. If you click one while no cherry-pick is in progress, CrossPick
-reports "No cherry-pick is currently in progress." instead of running git.
+Each transfer is a single-commit `git cherry-pick -x <sha>`. When it stops on
+conflicts:
+
+- CrossPick refreshes the IDE's view of the repository and opens the standard
+  merge dialog on the conflicted files (no need to run "Update Project").
+- The row shows **Resolving…** and no other commit can be picked until this one
+  is finished.
+- Resolve the conflicts and commit through the IDE (or the terminal). The commit
+  message is pre-filled by git, including the `(cherry picked from commit …)`
+  line. As soon as git leaves the cherry-picking state with a new HEAD, the row
+  is marked **Transferred**.
+- To give up instead, click **×** on the row (runs `git cherry-pick --abort`)
+  or abort from the IDE's Git menu; the row goes back to pending.
+- If you rescan while a pick is halted, CrossPick recognises the commit behind
+  `CHERRY_PICK_HEAD` and shows that row as **Resolving…** again.
 
 ## Known limitations / v1.1 ideas
 

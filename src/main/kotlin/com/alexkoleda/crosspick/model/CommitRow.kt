@@ -16,8 +16,12 @@ enum class TransferStatus {
     /** The commit's changes were already present in the target repository. */
     ALREADY_APPLIED,
 
-    /** The cherry-pick failed, most likely due to a conflict. */
-    FAILED,
+    /**
+     * The cherry-pick halted on conflicts and is waiting for the user to resolve them
+     * and commit (or abort). Resolves to [TRANSFERRED] or back to [PENDING] once the
+     * target repository leaves the cherry-picking state.
+     */
+    CONFLICT,
 
     /** Deliberately skipped by the user; will not be transferred. */
     SKIPPED
@@ -27,7 +31,7 @@ enum class TransferStatus {
  * Represents a single commit discovered in the source repository, along with its
  * current transfer state relative to the target (currently open) repository.
  *
- * Instances are mutable with respect to [status], [targetSha], and [message] so the
+ * Instances are mutable with respect to [status] and [message] so the
  * table model backing the UI can update rows in place as background work completes.
  */
 data class CommitRow(
@@ -38,6 +42,5 @@ data class CommitRow(
     val commitTimeMillis: Long,
     val subject: String,
     var status: TransferStatus = TransferStatus.PENDING,
-    var message: String? = null,
-    var targetSha: String? = null
+    var message: String? = null
 )
