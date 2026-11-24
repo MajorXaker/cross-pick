@@ -15,6 +15,7 @@ class CrossPickToolWindowFactory : ToolWindowFactory, DumbAware {
     override fun createToolWindowContent(project: Project, toolWindow: ToolWindow) {
         val panel = CrossPickPanel(project)
         val content = ContentFactory.getInstance().createContent(panel, "", false)
+        content.setDisposer(panel)
         toolWindow.contentManager.addContent(content)
     }
 }
